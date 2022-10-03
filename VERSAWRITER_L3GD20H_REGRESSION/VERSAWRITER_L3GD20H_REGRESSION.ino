@@ -1,6 +1,11 @@
+
 #include "l3gd20.h"
 #include "CharaData.h"
 #include <Wire.h>
+#include <WiFi.h>
+#include <string.h>
+
+#define NETON
 
 #define COL_BK  0    // 000 BLACK
 #define COL_BL  1    // 001 BLUE
@@ -11,7 +16,9 @@
 #define COL_YL  6    // 110 YELLOW
 #define COL_WH  7    // 111 WHITE
 
-#define LED_PIN 32
+//#define LED_PIN 32
+#define LED_CH  0
+#define LED_PIN A4  // GPIO32
 #define LED_L1  5  
 #define LED_L2  18
 #define LED_L3  23
@@ -27,19 +34,26 @@
 #define LED_G   13
 #define LED_B   12
 
-#define RET_RANGE   (-429)  // -30 dps
+#define AVE_LEN   9
+//#define HIS_LEN   81
 
-#define LED_PERIOD  (100L)
-#define GYRO_PERIOD (1000L)
-#define LOG_PERIOD  (100000L)
+#define HIS_LEN   27 
+#define ZEROSMP (HIS_LEN/2) 
+#define ZEROCHK (ZEROSMP*2/3)
+  
+#define MAX_SRV_CLIENTS 1
 
-hw_timer_t *timerA = NULL;    // For calc angle 
-hw_timer_t *timerL = NULL;    // For led control
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+const char* ssid = "HORNET";
+const char* password = "password";
+
+WiFiServer server(23);
+WiFiClient serverClients[MAX_SRV_CLIENTS];
 
 void gyro_int(void);
 void led_blink_int(void);
 void log_print(void *arg);
+void telnetserver(void *arg);
+void sendmessage(uint8_t sbuf,size_t len);
 
 volatile float angle = 0.0; 
 volatile int32_t z_data;
@@ -47,6 +61,10 @@ volatile float z_bias;
 volatile uint32_t tick = 0 ;
 volatile uint8_t on_led[DOTSUU]; 
 volatile uint32_t del_micros ; 
+
+static uint16_t tz_data[AVE_LEN];
+float angvel[HIS_LEN];
+uint32_t dtime[HIS_LEN];
 
 void gyro_write(uint8_t addr,uint8_t dat)
 {
@@ -100,13 +118,16 @@ void gyro_init(void)
   delay(40);
  
   ret = gyro_read(L3GD20_WHO_AM_I_ADDR);
-  Serial.print("WHOAMI register = 0x");Serial.println(ret,HEX);
-  
+  if(Serial){
+    Serial.print("WHOAMI register = 0x");
+    Serial.println(ret,HEX);
+  }
   if((ret == I_AM_L3GD20)||(ret == I_AM_L3GD20H)) {
-    Serial.println("L3GD20/H is found ");
-    digitalWrite( LED_PIN, LOW);
+    if(Serial)
+      Serial.println("L3GD20/H is found ");
   }else{
-    Serial.println("no L3GD20/H is found ");
+    if(Serial)
+      Serial.println("no L3GD20/H is found ");
     while(1);
     return ; 
   }
@@ -142,50 +163,74 @@ void gyro_init(void)
       ret=gyro_read(l3gd_adr);
 
   }while(ret != l3gd_reg);
-  Serial.printf("I did it ");
+  if(Serial)
+    Serial.printf("I did it ");
 }
-
-#define HIS_LEN   9 
-
 
 void gyro_i2c(void *arg)
 {
-  static uint16_t tz_data[HIS_LEN]={0,0,0,0,0,0,0,0,0};
   static uint32_t pre_micros = 0 ; 
   uint32_t cur_micros;
-//  uint8_t dmy;
-//  uint16_t dmy16;
   int32_t t_data;
   int32_t a_data;
   int32_t b_data;
   uint16_t idx ; 
-  
+
   int16_t i;
+  
   while(1){
-    
-    for(i=HIS_LEN-1;i>0;i--){
-      tz_data[i] = tz_data[i-1] ;
+      
+    for (i = HIS_LEN - 1; i > 0; i--) {
+      angvel[i] = angvel[i - 1];
+      dtime[i] = dtime[i - 1];
+    }
+  
+    for (i = AVE_LEN - 1; i > 0; i--) {
+      tz_data[i] = tz_data[i - 1] ;
     }
   
     tz_data[0] = (uint16_t)gyro_read(L3GD20_OUT_Z_H_ADDR);
-    tz_data[0] = tz_data[0]<<8 ;
+    tz_data[0] = tz_data[0] << 8 ;
     tz_data[0] |= gyro_read(L3GD20_OUT_Z_L_ADDR);
-
+  
     t_data = (int16_t)tz_data[0];
-
-    for(i=1;i<HIS_LEN;i++){
+  
+    for (i = 1; i < AVE_LEN; i++) {
       t_data += (int16_t)tz_data[i];
     }
-
+    z_data = - t_data / AVE_LEN;
+  
     cur_micros = micros();
     del_micros = cur_micros - pre_micros ;
-    pre_micros = cur_micros ; 
+    pre_micros = cur_micros ;
+    
+    dtime[0] = del_micros ; 
+    angvel[0] = ((float)z_data * D2D_L3GD20 - 0.0 * z_bias) ;
 
-    portENTER_CRITICAL_ISR(&timerMux);  
-    z_data = - t_data / HIS_LEN;
+    uint8_t cnt_pos=0,cnt_neg=0;
+    cnt_pos=0 ;
+    cnt_neg=0 ;
     
-    angle += ((float)z_data*D2D_L3GD20-0.0 * z_bias)*0.000001*(float)del_micros ;
+    for(i=0;i<ZEROSMP;i++){
+      if(angvel[i] > 0)
+        cnt_pos ++ ;
+      if(angvel[HIS_LEN-1-i] < 0)      
+        cnt_neg ++ ; 
+    }
     
+    if((cnt_pos > ZEROCHK) && (cnt_neg > ZEROCHK)){
+      float sum = 0.0 ; 
+      for(i=0;i<(HIS_LEN/2);i++){
+        sum += angvel[i]* 0.000001*dtime[i]; 
+      }
+      angle = sum ;
+    }else{  
+      angle += angvel[0] * 0.000001 * (float)del_micros ;
+    }
+
+//    if(angle < 0 ) 
+//      angle = 0 ;
+
     if((angle > (float)MOJISUU_OFS)&&(angle < (float)(MOJISUU+MOJISUU_OFS))){
   //        idx = MOJISUU - (uint16_t)(angle - (float)MOJISUU_OFS);
       idx = (uint16_t)(angle - (float)MOJISUU_OFS);
@@ -201,17 +246,12 @@ void gyro_i2c(void *arg)
         on_led[i] =  0; 
       }
     } 
-      
-    portEXIT_CRITICAL_ISR(&timerMux);
   }
-
 }
 
 void IRAM_ATTR onTimerA()//void gyro_int(void)
 {
-  portENTER_CRITICAL_ISR(&timerMux);
   tick++;
-  portEXIT_CRITICAL_ISR(&timerMux);
 }
 
 void LED_proc_sq(int lnum,int nc)
@@ -330,6 +370,7 @@ void led_proc(int nh,int nl,int nc)
     default:digitalWrite(LED_H1, LOW );digitalWrite(LED_H2, LOW );digitalWrite(LED_H3, LOW );digitalWrite(LED_H4, LOW );digitalWrite(LED_H5, LOW );
   }
 }
+
 void led_blink_int(void *arg)
 {
   float t_angle ;
@@ -338,31 +379,11 @@ void led_blink_int(void *arg)
   int premic ; 
   
   while(1){  
-  //  portENTER_CRITICAL_ISR(&timerMux);
-  //    t_angle = angle ;
-  //  portEXIT_CRITICAL_ISR(&timerMux);  
     for(i=0;i<DOTSUU;i++){
-//      premic = micros();
       LED_proc_sq(i+1,on_led[i]);   
-//      del_micros = micros() - premic; 
     }
   }
 }
-
-#if 0 
-/*****************************************************************************
- *                          Interrupt Service Routin                         *
- *****************************************************************************/
-void IRAM_ATTR onTimerA(){
-  // Increment the counter and set the time of ISR
-  gyro_int();
-}
- 
-void IRAM_ATTR onTimerL(){
-  // Increment the counter and set the time of ISR
-  led_blink_int();
-}
-#endif 
 
 // the setup function runs once when you press reset or power the board
 void setup() 
@@ -373,7 +394,6 @@ void setup()
   //while (!Serial);             // Leonardo: wait for serial monitor
 //  Serial.println("\n Light Stick Demo");
 
-  
   for(i=0;i<DOTSUU;i++){
       on_led[i] = 0 ; 
   }
@@ -382,7 +402,7 @@ void setup()
   gryo_bias();
 
   // initialize digital pin LED_BUILTIN as an output.
-  pinMode(LED_PIN, OUTPUT);// gpio_set_pull_mode(LED_PIN,GPIO_FLOATING); 
+//  pinMode(LED_PIN, OUTPUT);// gpio_set_pull_mode(LED_PIN,GPIO_FLOATING); 
   pinMode(LED_L1, OUTPUT);//  gpio_set_pull_mode(LED_L1,GPIO_FLOATING); 
   pinMode(LED_L2, OUTPUT);//  gpio_set_pull_mode(LED_L2 ,GPIO_FLOATING);
   pinMode(LED_L3, OUTPUT);//  gpio_set_pull_mode(LED_L3,GPIO_FLOATING); 
@@ -398,120 +418,150 @@ void setup()
   pinMode(LED_G, OUTPUT);//   gpio_set_pull_mode(LED_G,GPIO_FLOATING); 
   pinMode(LED_B, OUTPUT);//   gpio_set_pull_mode(LED_B,GPIO_FLOATING); 
 
+  ledcSetup(LED_CH,12800,8);
+  ledcAttachPin(LED_PIN,LED_CH);
+
+#ifdef NETON  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      if(Serial)
+        Serial.print(".");
+  }
+  server.begin();
+  server.setNoDelay(true);
+
+  if(Serial){
+    Serial.print("Ready! Use 'telnet ");
+    Serial.print(WiFi.localIP());
+    Serial.println(" 23' to connect");
+  }
+  xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 0);
+#endif 
+
   // ウォッチドッグ停止
   disableCore0WDT();
-  //disableCore1WDT(); 
-  xTaskCreatePinnedToCore(  gyro_i2c, "I2C_TASK", 4096, NULL, 1, NULL, 1);
+//  disableCore1WDT(); 
+  xTaskCreatePinnedToCore(  gyro_i2c, "I2C_TASK", 8192, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(  led_blink_int, "LED_TASK", 4096, NULL, 1, NULL, 0);
-//  xTaskCreatePinnedToCore(  log_print, "LOG_TASK", 4096, NULL, 1, NULL, 1);
 
-  // Timer: interrupt time and event setting.
-//  timerA = timerBegin(2, 80, true);
-//  timerL = timerBegin(1, 80, true);
+//  digitalWrite( LED_PIN, LOW);
+  ledcWrite(LED_CH,128);
+}  
 
-  // Attach onTimer function.
-//  timerAttachInterrupt(timerA, &onTimerA, true);
-//  timerAttachInterrupt(timerL, &onTimerL, true);
 
-  // Set alarm to call onTimer function every second (value in microseconds).
-//  timerAlarmWrite(timerA, 1000, true);// 1ms
-//  timerAlarmWrite(timerL, 10000, true);// 1ms
-
-  // Start an alarm
-//  timerAlarmEnable(timerA);
-//  timerAlarmEnable(timerL);
+void sendmessage(uint8_t *sbuf,size_t len)
+{
+  int i ;
+  for(i = 0; i < MAX_SRV_CLIENTS; i++){
+    if (serverClients[i] && serverClients[i].connected()){
+      serverClients[i].write(sbuf, len);
+    }
+  }
+}
+    
+void telnetserver(void *arg)
+{
+  int i ;
+  while(1){
+    if(WiFi.status() == WL_CONNECTED){
+      if (server.hasClient()){
+        for(i = 0; i < MAX_SRV_CLIENTS; i++){
+          //find free/disconnected spot
+          if (!serverClients[i] || !serverClients[i].connected()){
+            if(serverClients[i]) 
+              serverClients[i].stop();
+            serverClients[i] = server.available();
+            if(Serial){
+              if (!serverClients[i]) 
+                Serial.println("available broken");
+              Serial.print("New client: ");
+              Serial.print(i); 
+              Serial.print(' ');
+              Serial.println(serverClients[i].remoteIP());
+            }
+            break;
+          }
+        }
+        if (i >= MAX_SRV_CLIENTS) {
+          //no free/disconnected spot so reject
+          server.available().stop();
+        }
+      }
+    }else{
+      if(Serial)
+        Serial.println("WiFi not connected!");
+      for(i = 0; i < MAX_SRV_CLIENTS; i++) {
+        if (serverClients[i]) serverClients[i].stop();
+      }
+      delay(1000);    
+    }
+    delay(50);
+  }
 }
 
 void log_print(void *arg)
 {
   uint32_t t_tick ;
   float t_angle ;
-  while(1){
-//  portENTER_CRITICAL_ISR(&timerMux);
-    t_tick = tick ; 
-    t_angle = angle ;
-//  portEXIT_CRITICAL_ISR(&timerMux);  
-  
+  int i ;
+
+  t_tick = tick ; 
+  t_angle = angle ;
+  if(Serial){
     Serial.print(" tick = "); 
     Serial.print(t_tick,DEC); 
+    Serial.print(" del_t = "); 
+    Serial.print(del_micros,DEC); 
     Serial.print(" angle ="); 
-    Serial.println(t_angle,2);
-    delay(10);
+    Serial.print(t_angle,2);
+      
+    Serial.print(" angvel = "); 
+    for(i=0;i<HIS_LEN;i++){
+      Serial.print(angvel[i],3);
+      Serial.print(" "); 
+    }
+    
+    Serial.println();
   }
 }
 
+
 // the loop function runs over and over again forever
 void loop() {
-  static uint8_t l_ledcnt = 0 ;
-  static uint8_t l_ledcol = 0 ; 
+#ifdef NETON  
+  int i;
+  char sstr[4096];
+  char stmp[256];
+  sprintf(sstr, "del_t, %d, angle, %lf, angvel, ", del_micros, angle);
   
-  uint32_t t_tick ;
-  float t_angle ;
-  t_tick = tick ; 
-  t_angle = angle ;
+  for (i = 0; i < HIS_LEN; i++) {
+    sprintf(stmp, "%.2f,", angvel[i]);
+    strcat(sstr, stmp);
+  }
 
-  int i ;
-
-//  for(i=0;i<DOTSUU;i++){
-//      if(i==l_ledcnt)
-//        on_led[i] = l_ledcol+1 ;
-//      else
-//        on_led[i] = 0 ; 
-//  }
- 
-//  l_ledcnt ++; 
-//  if(l_ledcnt == DOTSUU) {
-//    l_ledcol++; 
-//    l_ledcol %= 7 ;
-//  }
-//  l_ledcnt = l_ledcnt % DOTSUU;  
-
-  Serial.print(" l_ledcnt = "); 
-  Serial.print(l_ledcnt,DEC); 
-  Serial.print(" l_ledcol = "); 
-  Serial.print(l_ledcol,DEC); 
-
-  Serial.print(" tick = "); 
-  Serial.print(t_tick,DEC); 
-  Serial.print(" del_t = "); 
-  Serial.print(del_micros,DEC); 
-  Serial.print(" angle ="); 
-  Serial.print(t_angle,2);
-  Serial.print(" on_led ="); 
+  strcat(sstr, "\n\r");
+  sendmessage((uint8_t*)sstr, strlen(sstr));
+  sprintf(sstr,"");
+//  Serial.print(sstr);
   
-  for(i=0;i<DOTSUU;i++)
-    Serial.print(on_led[i],DEC);
-  
-  Serial.println();
+#else    
+  log_print(NULL);
+#endif 
+  delay(10);
+  static int pre_millis = 0 ;
+  static int blinkcnt = 0 ; 
+  int cur_millis = millis();
+  if( (cur_millis - pre_millis) > 200 ){
+    pre_millis = cur_millis ; 
+    blinkcnt++; 
+//    Serial.println(blinkcnt%2);
     
-  delay(100);
-
-#if 0 
-  static uint8_t ledcnt = 0 ;
-
-  LED_proc_sq(ledcnt+1,7);
-  ledcnt ++; 
-  ledcnt = ledcnt % DOTSUU;  
-#endif 
-
-#if 0
-  uint8_t dmy ; 
-  uint16_t dmy16 ; 
-  uint16_t t_data ; 
-  int16_t z_data ;
-  float yawang = 0.0 ; 
-  
-  dmy=gyro_read(L3GD20_OUT_Z_L_ADDR);
-  t_data = (0x00ff&dmy);
-  Serial.printf("tdata = %04x \t",t_data ) ;
-  dmy=gyro_read(L3GD20_OUT_Z_H_ADDR);
-  dmy16 = dmy ;
-  t_data |= (0xff00&(dmy16<<8));
-  Serial.printf("tdata = %04x \t",t_data ) ;
-  z_data = t_data; 
-  Serial.printf("zdata = %d (%04x) \t",z_data,z_data ) ;
-
-  yawang = z_data * D2D_L3GD20 ; 
-  Serial.printf("yawang = %f \n\r",yawang) ;
-#endif 
+    if((blinkcnt % 2) == 0 )
+//      digitalWrite( LED_PIN, HIGH);
+      ledcWrite(LED_CH,128);
+    else
+//      digitalWrite( LED_PIN, LOW);
+      ledcWrite(LED_CH,255);
+  }
 }
