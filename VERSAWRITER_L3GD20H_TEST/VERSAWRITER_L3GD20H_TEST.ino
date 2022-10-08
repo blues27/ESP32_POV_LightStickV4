@@ -153,8 +153,6 @@ void gyro_i2c(void *arg)
   static uint16_t tz_data[HIS_LEN]={0,0,0,0,0,0,0,0,0};
   static uint32_t pre_micros = 0 ; 
   uint32_t cur_micros;
-//  uint8_t dmy;
-//  uint16_t dmy16;
   int32_t t_data;
   int32_t a_data;
   int32_t b_data;
@@ -216,8 +214,6 @@ void IRAM_ATTR onTimerA()//void gyro_int(void)
 
 void LED_proc_sq(int lnum,int nc)
 {
-//  led_proc(lnum%5+1,lnum/5+1,nc);
-
   digitalWrite(LED_R, HIGH);
   digitalWrite(LED_G, HIGH);
   digitalWrite(LED_B, HIGH);
@@ -338,33 +334,12 @@ void led_blink_int(void *arg)
   int premic ; 
   
   while(1){  
-  //  portENTER_CRITICAL_ISR(&timerMux);
-  //    t_angle = angle ;
-  //  portEXIT_CRITICAL_ISR(&timerMux);  
     for(i=0;i<DOTSUU;i++){
-//      premic = micros();
       LED_proc_sq(i+1,on_led[i]);   
-//      del_micros = micros() - premic; 
     }
   }
 }
 
-#if 0 
-/*****************************************************************************
- *                          Interrupt Service Routin                         *
- *****************************************************************************/
-void IRAM_ATTR onTimerA(){
-  // Increment the counter and set the time of ISR
-  gyro_int();
-}
- 
-void IRAM_ATTR onTimerL(){
-  // Increment the counter and set the time of ISR
-  led_blink_int();
-}
-#endif 
-
-// the setup function runs once when you press reset or power the board
 void setup() 
 {
   int i ; 
@@ -403,23 +378,6 @@ void setup()
   //disableCore1WDT(); 
   xTaskCreatePinnedToCore(  gyro_i2c, "I2C_TASK", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(  led_blink_int, "LED_TASK", 4096, NULL, 1, NULL, 0);
-//  xTaskCreatePinnedToCore(  log_print, "LOG_TASK", 4096, NULL, 1, NULL, 1);
-
-  // Timer: interrupt time and event setting.
-//  timerA = timerBegin(2, 80, true);
-//  timerL = timerBegin(1, 80, true);
-
-  // Attach onTimer function.
-//  timerAttachInterrupt(timerA, &onTimerA, true);
-//  timerAttachInterrupt(timerL, &onTimerL, true);
-
-  // Set alarm to call onTimer function every second (value in microseconds).
-//  timerAlarmWrite(timerA, 1000, true);// 1ms
-//  timerAlarmWrite(timerL, 10000, true);// 1ms
-
-  // Start an alarm
-//  timerAlarmEnable(timerA);
-//  timerAlarmEnable(timerL);
 }
 
 void log_print(void *arg)
@@ -427,10 +385,8 @@ void log_print(void *arg)
   uint32_t t_tick ;
   float t_angle ;
   while(1){
-//  portENTER_CRITICAL_ISR(&timerMux);
     t_tick = tick ; 
     t_angle = angle ;
-//  portEXIT_CRITICAL_ISR(&timerMux);  
   
     Serial.print(" tick = "); 
     Serial.print(t_tick,DEC); 

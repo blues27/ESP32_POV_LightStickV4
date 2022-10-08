@@ -30,9 +30,15 @@
 #define LED_H3  14
 #define LED_H4  26
 #define LED_H5  27
+
+/*
 #define LED_R   2
 #define LED_G   13
 #define LED_B   12
+*/
+#define LED_R   2
+#define LED_G   12
+#define LED_B   13
 
 #define BIAS_LEN 32
 
@@ -415,20 +421,23 @@ void setup()
 
 #ifdef NETON  
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      if(Serial)
-        Serial.print(".");
+  for(i=0;i<60;i++){
+    if(WiFi.status() == WL_CONNECTED) 
+      break;
+    delay(500);
+    if(Serial)
+      Serial.print(".");
   }
-  server.begin();
-  server.setNoDelay(true);
-
-  if(Serial){
-    Serial.print("Ready! Use 'telnet ");
-    Serial.print(WiFi.localIP());
-    Serial.println(" 23' to connect");
+  if(WiFi.status() == WL_CONNECTED){
+    server.begin();
+    server.setNoDelay(true);
+    if(Serial){
+      Serial.print("Ready! Use 'telnet ");
+      Serial.print(WiFi.localIP());
+      Serial.println(" 23' to connect");
+    }
+    xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 0);
   }
-  xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 0);
 #endif 
 
   // ウォッチドッグ停止
@@ -444,9 +453,11 @@ void setup()
 void sendmessage(uint8_t *sbuf,size_t len)
 {
   int i ;
-  for(i = 0; i < MAX_SRV_CLIENTS; i++){
-    if (serverClients[i] && serverClients[i].connected()){
-      serverClients[i].write(sbuf, len);
+  if(WiFi.status() == WL_CONNECTED){
+    for(i = 0; i < MAX_SRV_CLIENTS; i++){
+      if (serverClients[i] && serverClients[i].connected()){
+        serverClients[i].write(sbuf, len);
+      }
     }
   }
 }
@@ -497,7 +508,7 @@ void log_print(void *arg)
   float t_angle ;
   int i ;
 
-  t_tick = tick ; 
+  t_tick = millis(); 
   t_angle = angle ;
   if(Serial){
     Serial.print(" tick = "); 
