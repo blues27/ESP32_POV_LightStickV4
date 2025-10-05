@@ -1,4 +1,5 @@
 #include "l3gd20.h"
+#include "mpu6050.h"
 #include "CharaData.h"
 #include <Wire.h>
 #include <WiFi.h>
@@ -44,8 +45,8 @@
   
 #define MAX_SRV_CLIENTS 1
 
-const char* ssid = "HORNET";
-const char* password = "password";
+const char* ssid = "GL-AR750S-faa";
+const char* password = "goodlife";
 
 WiFiServer server(23);
 WiFiClient serverClients[MAX_SRV_CLIENTS];
@@ -65,6 +66,8 @@ volatile uint32_t del_micros ;
 uint16_t tz_data[AVE_LEN];
 float angvel[HIS_LEN];
 uint32_t dtime[HIS_LEN];
+uint8_t imu_addr ; 
+
 
 void gyro_write(uint8_t addr,uint8_t dat)
 {
@@ -426,7 +429,8 @@ void setup()
     Serial.print(WiFi.localIP());
     Serial.println(" 23' to connect");
   }
-  xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 1);
+//  xTaskCreatePinnedToCore(  telnetserver, "TELNET_TASK", 4096, NULL, 1, NULL, 0);
 #endif 
 
   // ウォッチドッグ停止

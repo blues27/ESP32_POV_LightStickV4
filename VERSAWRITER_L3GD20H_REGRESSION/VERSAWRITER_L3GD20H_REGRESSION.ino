@@ -5,7 +5,7 @@
 #include <WiFi.h>
 #include <string.h>
 
-#define NETON
+//#define NETON
 
 #define COL_BK  0    // 000 BLACK
 #define COL_BL  1    // 001 BLUE

@@ -1,0 +1,976 @@
+#include "ICM42670P.h"
+#include "CharaData.h"
+#include <SPI.h>
+#include <APA102.h>
+#include <esp_task_wdt.h>  // ウォッチドッグ関連の関数用
+
+#define BI_DIRECTION  1
+
+// SK9822 LED strip configuration using APA102 library
+const uint8_t dataPin = 7;
+const uint8_t clockPin = 9;
+const uint16_t ledCount = 65;  // Half of 130 LEDs
+
+// Create an object for writing to the LED strip
+APA102<dataPin, clockPin> ledStrip;
+
+// Color definitions for SK9822 using APA102 library
+const rgb_color colors[] = {
+  rgb_color(0, 0, 0),        // COL_BK - BLACK
+  rgb_color(0, 0, 255),      // COL_BL - BLUE
+  rgb_color(255, 0, 0),      // COL_RD - RED
+  rgb_color(255, 0, 255),    // COL_PR - PURPLE
+  rgb_color(0, 255, 0),      // COL_GR - GREEN
+  rgb_color(0, 255, 255),    // COL_SB - SKY BLUE
+  rgb_color(255, 255, 0),    // COL_YL - YELLOW
+  rgb_color(255, 255, 255)   // COL_WH - WHITE
+};
+
+// Create a buffer for holding the LED colors
+rgb_color ledColors[ledCount];
+
+// Set the brightness (0-31)
+const uint8_t brightness = 8;
+
+// ICM42670P SPI configuration
+#define ICM_CS_PIN      10
+#define ICM_MOSI_PIN    11
+#define ICM_MISO_PIN    13
+#define ICM_SCLK_PIN    12
+#define ICM_INT1_PIN    17
+#define ICM_INT2_PIN    18
+#define ICM_SPI_FREQ    1000000  // 1MHz
+
+// ICM42670P instance
+ICM42670 icm42670p(SPI,ICM_CS_PIN,ICM_SPI_FREQ);
+
+#define ICM_SENS_SCALE_FACTOR 16.4
+
+// Motion variables (protected by mutex)
+volatile float angle = 90.0;  // 初期角度を90度に設定（右腕を前方に向けた状態）
+volatile float raw_angle = 90.0;  // 正規化前の生の角度
+volatile float angle_offset = 0.0;  // 角度オフセット（キャリブレーション用）
+volatile float gyro_z = 0.0;
+volatile float gyro_drift_compensation = 0.0;  // ドリフト補正値
+volatile uint32_t last_update_time = 0;
+volatile uint32_t last_drift_update = 0;  // ドリフト補正の更新時間
+volatile uint8_t on_led[DOTSUU];
+volatile bool led_update_flag = false;
+
+// ターニングポイント検出用の変数
+volatile float prev_gyro_z = 0.0;
+volatile int direction_state = 0;  // -1: 左回転, 0: 停止, 1: 右回転
+volatile int prev_direction_state = 0;
+volatile uint32_t direction_change_time = 0;
+volatile uint32_t last_direction_change_time = 0;
+volatile bool direction_stable = false;
+volatile int stable_count = 0;
+
+volatile bool stroke_active = false;
+volatile float stroke_start_time = 0;
+
+// 双方向対応のための新しい変数を追加
+volatile bool swing_direction_right_to_left = true;  // true: 右→左, false: 左→右
+volatile float swing_start_angle = 0.0;  // 振り開始時の角度
+volatile bool swing_in_progress = false;  // 振り動作中フラグ
+volatile uint32_t last_swing_change = 0;  // 最後の振り方向変更時刻
+
+volatile uint16_t last_column_index = 0;  // 前回の振りで到達した最後の列インデックス
+volatile uint16_t current_column_index = 0;  // 現在の列インデックス
+
+// 定数定義
+const float SWING_DIRECTION_THRESHOLD = 10.0;  // 振り方向変更の閾値(dps)
+const uint32_t MIN_SWING_DURATION = 200000;    // 最小振り継続時間(200ms)
+const float ANGLE_RESET_THRESHOLD = 5.0;       // 角度リセット閾値
+
+
+// 調整可能なパラメータ
+const float GYRO_THRESHOLD = 20.0;      // 回転検出の閾値 (dps) - より高く設定
+const int STABLE_COUNT_THRESHOLD = 30;   // 方向が安定したと判断するサンプル数 - より短く
+const uint32_t MIN_DIRECTION_TIME = 100000; // 最小方向継続時間 (microseconds, 100ms) - より短く
+const float RESET_ANGLE_THRESHOLD = 2.0; // リセット時の角度閾値 - より小さく
+const int RESET_DIRECTION_FROM = 1;      // リセットを行う方向転換 (1: 右→左, -1: 左→右)
+const int RESET_DIRECTION_TO = -1;       // リセットを行う方向転換の到達方向
+
+// Calibration variables
+float gyro_z_bias = 0.0;
+bool calibration_done = false;
+
+// Task handles
+TaskHandle_t gyroTaskHandle = NULL;
+
+// Mutex for shared data protection
+SemaphoreHandle_t dataMutex = NULL;
+
+// Function declarations
+void gyroUpdateTask(void *parameter);
+void detectTurningPoint();
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("VersaWriter ICM42670P Demo - Multi-thread version with Turning Point Reset");
+  
+  // Create mutex for data protection
+  dataMutex = xSemaphoreCreateMutex();
+  if (dataMutex == NULL) {
+    Serial.println("Failed to create mutex");
+    while (1);
+  }
+  
+  // Initialize LED array
+  for (int i = 0; i < DOTSUU; i++) {
+    on_led[i] = 0;
+  }
+  
+  // Initialize LED color buffer
+  for (int i = 0; i < ledCount; i++) {
+    ledColors[i] = rgb_color(0, 0, 0);
+  }
+  
+  // Configure ICM42670P pins
+  pinMode(ICM_CS_PIN, OUTPUT);
+  pinMode(ICM_INT1_PIN, INPUT);
+  pinMode(ICM_INT2_PIN, INPUT);
+  
+  // Initialize SPI for ICM42670P
+  SPI.begin(ICM_SCLK_PIN, ICM_MISO_PIN, ICM_MOSI_PIN, ICM_CS_PIN);
+  
+  // Initialize ICM42670P
+  if (icm42670p.begin() != 0) {
+    Serial.println("ICM42670P initialization failed!");
+    while (1);
+  }
+  
+  Serial.println("ICM42670P initialized successfully");
+  
+  // Start & Configure accelerometer  
+  icm42670p.startAccel(800,16);
+  
+  // Start & Configure gyroscope
+  icm42670p.startGyro(800,2000);
+  
+  // Calibrate gyroscope
+  calibrateGyro();
+  
+  // Clear all LEDs
+  clearAllLEDs();
+  
+  // 初期角度を90度に設定（右腕を前方45度の位置）
+  angle = 90.0;
+  raw_angle = 90.0;
+  last_drift_update = micros();
+  
+  last_update_time = micros();
+  direction_change_time = micros();
+  last_direction_change_time = micros();
+
+  // Watchdog timerを完全に無効化
+  esp_task_wdt_deinit();
+
+  // Create gyro update task (medium priority, Core 1)
+  xTaskCreatePinnedToCore(
+    gyroUpdateTask,     // Task function
+    "GYRO_UPDATE",      // Task name
+    4096,              // Stack size
+    NULL,              // Parameter
+    2,                 // Priority (medium)
+    &gyroTaskHandle,   // Task handle
+    0                  // Core 1
+  );
+  
+  if (gyroTaskHandle == NULL) {
+    Serial.println("Failed to create tasks");
+    while (1);
+  }
+  
+  Serial.println("Tasks created successfully");
+  Serial.println("Setup complete");
+}
+
+void calibrateGyro() {
+  Serial.println("Calibrating gyroscope... Keep device stationary");
+  
+  const int num_samples = 1000;
+  float sum_z = 0.0;
+  
+  for (int i = 0; i < num_samples; i++) {
+    inv_imu_sensor_event_t imu_event;
+    
+    if (icm42670p.getDataFromRegisters(imu_event) == 0) {
+      sum_z += imu_event.gyro[2];
+    }
+    
+    delay(5);
+    
+    if (i % 100 == 0) {
+      Serial.print(".");
+    }
+  }
+  
+  gyro_z_bias = sum_z / num_samples;
+  calibration_done = true;
+  
+  Serial.println();
+  Serial.print("Gyro Z bias: ");
+  Serial.println(gyro_z_bias);
+  Serial.println("Calibration complete");
+}
+
+#if BI_DIRECTION
+void detectSwingDirection() {
+  uint32_t current_time = micros();
+  float current_gyro = gyro_z;
+  
+  // 振り方向の検出
+  bool new_direction_right_to_left = (current_gyro > 0);  // 正の角速度 = 右→左
+  
+  // 明確な角速度変化があった場合の振り方向変更検出
+  if (fabs(current_gyro) > SWING_DIRECTION_THRESHOLD) {
+    
+    // 振り方向の変更を検出
+    if (swing_direction_right_to_left != new_direction_right_to_left && 
+        (current_time - last_swing_change) > MIN_SWING_DURATION) {
+      
+      Serial.print("Swing direction changed: ");
+      Serial.print(swing_direction_right_to_left ? "R→L" : "L→R");
+      Serial.print(" to ");
+      Serial.print(new_direction_right_to_left ? "R→L" : "L→R");
+      
+      // 前回の振りで到達した列インデックスを保存
+      if (swing_direction_right_to_left) {
+        // 右→左の振りが終わった場合、現在の列インデックスを保存
+        last_column_index = current_column_index;
+        Serial.print(", Last column: ");
+        Serial.print(last_column_index);
+      }
+      
+      // 振り方向を更新
+      swing_direction_right_to_left = new_direction_right_to_left;
+      
+      // 角度をリセット
+      raw_angle = 0.0;
+      swing_start_angle = 0.0;
+      swing_in_progress = true;
+      last_swing_change = current_time;
+      
+      Serial.print(", Reset angle to 0");
+      Serial.println();
+    }
+  }
+  
+  // 振り動作の継続判定
+  if (fabs(current_gyro) > 1.0) {  // 1dps以上で振り動作継続
+    swing_in_progress = true;
+  } else if (fabs(current_gyro) < 0.5) {  // 0.5dps以下で振り停止
+    swing_in_progress = false;
+  }
+}
+
+
+
+void updateAngleFromGyro() {
+  if (!calibration_done) return;
+  
+  inv_imu_sensor_event_t imu_event;
+  
+  if (icm42670p.getDataFromRegisters(imu_event) == 0) {
+    uint32_t current_time = micros();
+    float dt = (current_time - last_update_time) / 1000000.0;
+    
+    if (dt > 0.0001) {
+      // バイアス補正とドリフト補正を適用
+      float current_gyro_z = imu_event.gyro[2] - gyro_z_bias;
+      
+      // ドリフト補正の更新
+      if (current_time - last_drift_update > 10000000) {
+        if (fabs(current_gyro_z) < 5.0) {
+          gyro_drift_compensation = gyro_drift_compensation * 0.99 + current_gyro_z * 0.01;
+        }
+        last_drift_update = current_time;
+      }
+      
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        // 角速度の更新
+        gyro_z = -(current_gyro_z - gyro_drift_compensation) / ICM_SENS_SCALE_FACTOR;
+        
+        // 微小値のゼロクランプ
+        if (fabs(gyro_z) < 0.5) {
+          gyro_z = 0.0;
+        }
+        
+        // 振り方向の検出
+        detectSwingDirection();
+        
+        // 角度の更新（双方向対応）
+        if (swing_in_progress) {
+          if (swing_direction_right_to_left) {
+            // 右→左の振り：正の角速度のみを積分
+            if (gyro_z > 0) {
+              raw_angle += gyro_z * dt;
+            }
+          } else {
+            // 左→右の振り：負の角速度を正の角度として積分
+            if (gyro_z < 0) {
+              raw_angle += (-gyro_z) * dt;  // 負の角速度を正の角度変化に変換
+            }
+          }
+        }
+        
+        // 角度範囲の制限（0-180度）
+        if (raw_angle < 0.0) {
+          raw_angle = 0.0;
+        } else if (raw_angle > 180.0) {
+          raw_angle = 180.0;
+        }
+        
+        angle = raw_angle;
+        last_update_time = current_time;
+        
+        xSemaphoreGive(dataMutex);
+      }
+    }
+  }
+}
+
+void updateLEDPattern() {
+  float local_angle;
+  bool local_swing_direction;
+  uint16_t local_last_column_index;
+  
+  // スレッドセーフな値の取得
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    local_angle = angle;
+    local_swing_direction = swing_direction_right_to_left;
+    local_last_column_index = last_column_index;
+    xSemaphoreGive(dataMutex);
+  } else {
+    return;
+  }
+  
+  // LEDパターンの計算
+  uint8_t new_on_led[DOTSUU];
+  for (int i = 0; i < DOTSUU; i++) {
+    new_on_led[i] = 0;
+  }
+  
+  // 角度の正規化（0-180度）
+  float display_angle = local_angle;
+  if (display_angle < 0.0) {
+    display_angle = 0.0;
+  } else if (display_angle > 180.0) {
+    display_angle = 180.0;
+  }
+  
+  // 列インデックスの計算
+  uint16_t idx = 0;
+  
+  if (local_swing_direction) {
+    // 右→左の振り：0列目から順番に増加
+    if (((uint16_t)(display_angle) >= MOJISUU_OFS) && 
+        ((uint16_t)(display_angle) < (MOJISUU + MOJISUU_OFS))) {
+      
+      idx = (uint16_t)(display_angle) - MOJISUU_OFS;
+      
+      // 現在の列インデックスを更新
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        current_column_index = idx;
+        xSemaphoreGive(dataMutex);
+      }
+      
+      // 通常の順序でLEDパターンを設定
+      for (int i = 0; i < DOTSUU; i++) {
+        new_on_led[i] = moji[(DOTSUU-1)-i][idx];
+      }
+    }
+  } else {
+    // 左→右の振り：前回の最後の列から0列目に向かって減少
+    if (((uint16_t)(display_angle) >= MOJISUU_OFS) && 
+        ((uint16_t)(display_angle) < (MOJISUU + MOJISUU_OFS))) {
+      
+      // 角度を列インデックスにマッピング
+      uint16_t angle_based_idx = (uint16_t)(display_angle) - MOJISUU_OFS;
+      
+      // 前回の最後の列から現在の角度に基づいて逆方向にマッピング
+      if (local_last_column_index < MOJISUU) {
+        // 進行度を計算（0.0〜1.0）
+        float progress = (float)angle_based_idx / (float)(MOJISUU - 1);
+        
+        // 前回の最後の列から0列目に向かって減少
+        idx = local_last_column_index - (uint16_t)(progress * local_last_column_index);
+        
+        // 範囲チェック
+        if (idx >= MOJISUU) {
+          idx = 0;
+        }
+      } else {
+        idx = 0;
+      }
+      
+      // 現在の列インデックスを更新
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        current_column_index = idx;
+        xSemaphoreGive(dataMutex);
+      }
+      
+      // LEDパターンを設定
+      for (int i = 0; i < DOTSUU; i++) {
+        new_on_led[i] = moji[(DOTSUU-1)-i][idx];
+      }
+    }
+  }
+  
+  // 共有LEDパターンの更新
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    memcpy((void*)on_led, new_on_led, DOTSUU);
+    led_update_flag = true;
+    xSemaphoreGive(dataMutex);
+  }
+}
+
+#else  
+
+// 改良案1: 角速度の符号に基づく角度リセット機能を追加
+
+void detectTurningPoint() {
+  uint32_t current_time = micros();
+  float current_gyro = gyro_z;
+  
+  // 現在の回転方向を判定
+  int current_direction = 0;
+  if (current_gyro > GYRO_THRESHOLD) {
+    current_direction = 1;  // 右回転（正回転）
+  } else if (current_gyro < -GYRO_THRESHOLD) {
+    current_direction = -1; // 左回転（負回転）
+  } else {
+    current_direction = 0;  // 停止
+  }
+  
+  // 【改良1】負の角速度（左回転）が検出されたら角度を0にリセット
+  if (current_direction == -1) {
+    Serial.print("Left rotation detected - Reset angle to 0: ");
+    Serial.print(raw_angle);
+    Serial.print(" -> 0");
+    raw_angle = 0.0;
+    angle = 0.0;
+    Serial.println();
+    
+    // 状態をリセット
+    direction_state = current_direction;
+    stable_count = 0;
+    direction_stable = false;
+    last_direction_change_time = current_time;
+    return;
+  }
+/*  
+  // 【改良2】右端（180度近く）に達したら0度にリセット
+  if (raw_angle > 175.0) {
+    Serial.print("Right end reached - Reset angle to 0: ");
+    Serial.print(raw_angle);
+    Serial.print(" -> 0");
+    raw_angle = 0.0;
+    angle = 0.0;
+    Serial.println();
+    
+    // 状態をリセット
+    direction_state = current_direction;
+    stable_count = 0;
+    direction_stable = false;
+    last_direction_change_time = current_time;
+    return;
+  }
+*/  
+  // 方向の変化を検出（従来のコード）
+  if (current_direction != direction_state) {
+    if (current_direction != 0) {
+      stable_count = 1;
+      direction_state = current_direction;
+      direction_stable = false;
+    } else {
+      stable_count = 0;
+      direction_stable = false;
+    }
+  } else if (current_direction != 0) {
+    stable_count++;
+    
+    if (!direction_stable && stable_count >= STABLE_COUNT_THRESHOLD) {
+      direction_stable = true;
+      
+      if (prev_direction_state != 0 && 
+          direction_state != prev_direction_state && 
+          (current_time - last_direction_change_time) > MIN_DIRECTION_TIME) {
+        
+        Serial.print("Turning point detected! Direction: ");
+        Serial.print(prev_direction_state);
+        Serial.print(" -> ");
+        Serial.print(direction_state);
+        Serial.print(", Raw Angle: ");
+        Serial.println(raw_angle);
+        
+        last_direction_change_time = current_time;
+      }
+      
+      prev_direction_state = direction_state;
+    }
+  }
+  
+  prev_gyro_z = current_gyro;
+}
+
+void updateAngleFromGyro() {
+  if (!calibration_done) return;
+  
+  inv_imu_sensor_event_t imu_event;
+  
+  if (icm42670p.getDataFromRegisters(imu_event) == 0) {
+    uint32_t current_time = micros();
+    float dt = (current_time - last_update_time) / 1000000.0;  // Convert to seconds
+    
+    if (dt > 0.0001) {  // Minimum time threshold
+      // Apply bias correction
+      float current_gyro_z = imu_event.gyro[2] - gyro_z_bias;
+      
+      // ドリフト補正の更新（10秒間隔）
+      if (current_time - last_drift_update > 10000000) {  // 10秒
+        // 低速回転時のみドリフト補正を更新
+        if (fabs(current_gyro_z) < 5.0) {  // 5 dps以下の時
+          gyro_drift_compensation = gyro_drift_compensation * 0.99 + current_gyro_z * 0.01;
+        }
+        last_drift_update = current_time;
+      }
+      
+      // Update shared variables with mutex protection
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        // ドリフト補正を適用
+        gyro_z = -(current_gyro_z - gyro_drift_compensation) / ICM_SENS_SCALE_FACTOR;
+#if 0        
+        // 微小な値をゼロクランプ（ノイズ除去）
+        if (fabs(gyro_z) < 0.5) {  // 0.5 dps以下はゼロとする
+          gyro_z = 0.0;
+        }
+        
+        // 【改良3】正の角速度のみを積分（負の角速度は無視）
+        if (gyro_z > 0) {
+          raw_angle += gyro_z * dt;  // 正の角速度のみ積分
+        }
+        // 負の角速度の場合は角度を更新しない（または0にリセット）
+        else if (gyro_z < -1.0) {  // 明確な負の回転の場合
+          raw_angle = 0.0;  // 角度をリセット
+        }
+        
+        // 【改良4】角度を0-180度の範囲に制限
+        if (raw_angle < 0.0) {
+          raw_angle = 0.0;
+        } else if (raw_angle > 180.0) {
+//          raw_angle = 0.0;  // 180度を超えたら0度にリセット
+          raw_angle = 180.0;  // 180度を超えたら180度に維持
+        }
+
+#else 
+  // ストローク開始判定
+  if (!stroke_active && gyro_z > 2.0) {  // 正の角速度でストローク開始
+    stroke_active = true;
+    raw_angle = 0.0;  // ストローク開始時に角度リセット
+    stroke_start_time = current_time;
+    Serial.println("Stroke started - angle reset to 0");
+  }
+  
+  // ストローク中の角度更新
+  if (stroke_active) {
+    if (gyro_z > 0) {
+      raw_angle += gyro_z * dt;  // 正の角速度のみ加算
+    } else if (gyro_z < -2.0) {  // 明確な逆回転でストローク終了
+      stroke_active = false;
+      Serial.println("Stroke ended");
+    }
+  }
+#endif 
+
+
+
+        angle = raw_angle;  // 表示用角度
+        last_update_time = current_time;
+        
+        // ターニングポイント検出
+        detectTurningPoint();
+        
+        xSemaphoreGive(dataMutex);
+      }
+    }
+  }
+}
+
+void updateLEDPattern() {
+  float local_angle;
+  
+  // Get current angle in thread-safe way
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    local_angle = angle;
+    xSemaphoreGive(dataMutex);
+  } else {
+    return; // Skip update if mutex not available
+  }
+  
+  // Calculate new LED pattern
+  uint8_t new_on_led[DOTSUU];
+  for (int i = 0; i < DOTSUU; i++) {
+    new_on_led[i] = 0;
+  }
+  
+  // 【改良5】角度を0-180度でLED表示にマッピング（正規化処理を簡素化）
+  float display_angle = local_angle;
+  
+  // 角度を0-180度の範囲に確実に収める
+  if (display_angle < 0.0) {
+    display_angle = 0.0;
+  } else if (display_angle > 180.0) {
+    display_angle = 180.0;
+  }
+  
+  // 0度～180度を moji配列の 0～(MOJISUU-1) にマッピング
+  float normalized_angle = display_angle;  // 0～180の範囲
+  uint16_t idx ;
+  if ( ((uint16_t)(normalized_angle) >= MOJISUU_OFS) && ((uint16_t)(normalized_angle) < (MOJISUU + MOJISUU_OFS)) ) {
+    idx =  ((uint16_t)(normalized_angle) - MOJISUU_OFS ) ;  
+    for (int i = 0; i < DOTSUU; i++) {
+      new_on_led[i] = moji[(DOTSUU-1)-i][idx];
+    }
+  }else{
+    for (int i = 0; i < DOTSUU; i++) {
+      new_on_led[i] = 0 ;
+    }
+  }
+  // Copy column data to LED array
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    memcpy((void*)on_led, new_on_led, DOTSUU);
+    led_update_flag = true;
+    xSemaphoreGive(dataMutex);
+  }
+  // Update shared LED pattern with mutex protection
+}
+#endif 
+
+void clearAllLEDs() {
+  for (int i = 0; i < ledCount; i++) {
+    ledColors[i] = rgb_color(0, 0, 0);
+  }
+  ledStrip.write(ledColors, ledCount, brightness);
+}
+
+
+void updateLEDs() {
+  // Clear all LEDs first
+  for (int i = 0; i < ledCount; i++) {
+    ledColors[i] = rgb_color(0, 0, 0);
+  }
+  
+  // Map character data to LED positions (thread-safe copy)
+  uint8_t local_on_led[DOTSUU];
+  
+  if (xSemaphoreTake(dataMutex, portMAX_DELAY) == pdTRUE) {
+    memcpy(local_on_led, (void*)on_led, DOTSUU);
+    xSemaphoreGive(dataMutex);
+  }
+  
+  for (int i = 0; i < DOTSUU && i < ledCount; i++) {
+    uint8_t color_index = local_on_led[i];
+    
+    if (color_index > 0 && color_index < 8) {
+      ledColors[i] = colors[color_index];
+    }
+  }
+  
+  // Write to LED strip
+  ledStrip.write(ledColors, ledCount, brightness);
+}
+
+
+#if 0 
+void detectTurningPoint() {
+  uint32_t current_time = micros();
+  float current_gyro = gyro_z;
+  
+  // 現在の回転方向を判定
+  int current_direction = 0;
+  if (current_gyro > GYRO_THRESHOLD) {
+    current_direction = 1;  // 右回転
+  } else if (current_gyro < -GYRO_THRESHOLD) {
+    current_direction = -1; // 左回転
+  } else {
+    current_direction = 0;  // 停止
+  }
+  
+  // 右端でのリセット（片側リセットのみ）
+  if (raw_angle > 175.0 && current_direction <= 0) {
+    Serial.print("Right end reset at angle: ");
+    Serial.print(raw_angle);
+    Serial.print(", Gyro: ");
+    Serial.print(current_gyro);
+    raw_angle = 5.0;  // 5度にリセット（0度ではなく）
+    angle = raw_angle;
+    Serial.println(" -> Reset to 5 (start position)");
+    
+    // 状態をリセット
+    direction_state = current_direction;
+    stable_count = 0;
+    direction_stable = false;
+    last_direction_change_time = current_time;
+    return;
+  }
+  
+  // 方向の変化を検出
+  if (current_direction != direction_state) {
+    if (current_direction != 0) {
+      stable_count = 1;
+      direction_state = current_direction;
+      direction_stable = false;
+    } else {
+      stable_count = 0;
+      direction_stable = false;
+    }
+  } else if (current_direction != 0) {
+    stable_count++;
+    
+    if (!direction_stable && stable_count >= STABLE_COUNT_THRESHOLD) {
+      direction_stable = true;
+      
+      if (prev_direction_state != 0 && 
+          direction_state != prev_direction_state && 
+          (current_time - last_direction_change_time) > MIN_DIRECTION_TIME) {
+        
+        Serial.print("Turning point detected! Direction: ");
+        Serial.print(prev_direction_state);
+        Serial.print(" -> ");
+        Serial.print(direction_state);
+        Serial.print(", Raw Angle: ");
+        Serial.println(raw_angle);
+        
+        last_direction_change_time = current_time;
+      }
+      
+      prev_direction_state = direction_state;
+    }
+  }
+  
+  prev_gyro_z = current_gyro;
+}
+
+void updateAngleFromGyro() {
+  if (!calibration_done) return;
+  
+  inv_imu_sensor_event_t imu_event;
+  
+  if (icm42670p.getDataFromRegisters(imu_event) == 0) {
+    uint32_t current_time = micros();
+    float dt = (current_time - last_update_time) / 1000000.0;  // Convert to seconds
+    
+    if (dt > 0.0001) {  // Minimum time threshold
+      // Apply bias correction
+      float current_gyro_z = imu_event.gyro[2] - gyro_z_bias;
+      
+      // ドリフト補正の更新（10秒間隔）
+      if (current_time - last_drift_update > 10000000) {  // 10秒
+        // 低速回転時のみドリフト補正を更新
+        if (fabs(current_gyro_z) < 5.0) {  // 5 dps以下の時
+          gyro_drift_compensation = gyro_drift_compensation * 0.99 + current_gyro_z * 0.01;
+        }
+        last_drift_update = current_time;
+      }
+      
+      // Update shared variables with mutex protection
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        // ドリフト補正を適用
+        gyro_z = -(current_gyro_z - gyro_drift_compensation) / ICM_SENS_SCALE_FACTOR;
+        
+        // 微小な値をゼロクランプ（ノイズ除去）
+        if (fabs(gyro_z) < 0.5) {  // 0.5 dps以下はゼロとする
+          gyro_z = 0.0;
+        }
+        
+        raw_angle += gyro_z * dt;  // 生の角度を更新
+        angle = raw_angle;  // 表示用角度も同じ値
+        last_update_time = current_time;
+        
+        // ターニングポイント検出
+        detectTurningPoint();
+        
+        xSemaphoreGive(dataMutex);
+      }
+    }
+  }
+}
+
+void updateLEDPattern() {
+  float local_angle;
+  
+  // Get current angle in thread-safe way
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    local_angle = angle;
+    xSemaphoreGive(dataMutex);
+  } else {
+    return; // Skip update if mutex not available
+  }
+  
+  // Calculate new LED pattern
+  uint8_t new_on_led[DOTSUU];
+  for (int i = 0; i < DOTSUU; i++) {
+    new_on_led[i] = 0;
+  }
+  
+  // 角度を正の範囲にマッピング
+  float display_angle = local_angle;
+  
+  // 負の角度を正の範囲にマッピング（360度周期で正規化）
+  while (display_angle < 0) {
+    display_angle += 180.0;
+  }
+  while (display_angle >= 180.0) {
+    display_angle -= 180.0;
+  }
+  
+  // 5度～175度の範囲でLED表示
+  if (display_angle >= 5.0 && display_angle <= 175.0) {
+    // 5度～175度を moji配列の 0～(MOJISUU-1) にマッピング
+    float normalized_angle = display_angle - 5.0;  // 0～170の範囲に
+    uint16_t idx = (uint16_t)((normalized_angle / 170.0) * (MOJISUU - 1));
+    
+    if (idx >= MOJISUU) {
+      idx = MOJISUU - 1;
+    }
+    
+    // Copy column data to LED array
+    for (int i = 0; i < DOTSUU; i++) {
+      new_on_led[i] = moji[(DOTSUU-1)-i][idx];
+    }
+  }
+  
+  // Update shared LED pattern with mutex protection
+  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+    memcpy((void*)on_led, new_on_led, DOTSUU);
+    led_update_flag = true;
+    xSemaphoreGive(dataMutex);
+  }
+}
+#endif 
+
+
+// Gyro update task - runs every 1ms on Core 1
+void gyroUpdateTask(void *parameter) {
+  Serial.println("Gyro update task started on Core 1");
+  
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  const TickType_t frequency = pdMS_TO_TICKS(1);  // 1ms = 1000Hz
+  
+  while (1) {
+    // Update angle from gyroscope
+    updateAngleFromGyro();
+    
+    // Update LED pattern based on new angle
+    updateLEDPattern();
+    bool should_update = false;
+    
+    // Check if LED update is needed
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+      should_update = led_update_flag;
+      if (should_update) {
+        led_update_flag = false;
+      }
+      xSemaphoreGive(dataMutex);
+    }
+    
+    if (should_update) {
+      updateLEDs();
+    }
+
+    // Wait for next cycle (1ms interval)
+    vTaskDelayUntil(&lastWakeTime, frequency);
+  }
+}
+
+#if BI_DIRECTION
+// デバッグ用のloop関数内の表示部分も更新
+void loop() {
+  static uint32_t last_serial_output = 0;
+  uint32_t current_time = millis();
+  
+  if (current_time - last_serial_output >= 100) {
+    float local_angle, local_gyro_z;
+    bool local_swing_direction, local_swing_in_progress;
+    uint16_t local_current_column, local_last_column;
+    
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      local_angle = angle;
+      local_gyro_z = gyro_z;
+      local_swing_direction = swing_direction_right_to_left;
+      local_swing_in_progress = swing_in_progress;
+      local_current_column = current_column_index;
+      local_last_column = last_column_index;
+      xSemaphoreGive(dataMutex);
+      
+      Serial.print("Angle: ");
+      Serial.print(local_angle, 2);
+      Serial.print("°, Gyro Z: ");
+      Serial.print(local_gyro_z, 2);
+      Serial.print(" dps, Direction: ");
+      Serial.print(local_swing_direction ? "R→L" : "L→R");
+      Serial.print(", Active: ");
+      Serial.print(local_swing_in_progress ? "Yes" : "No");
+      Serial.print(", Current Col: ");
+      Serial.print(local_current_column);
+      Serial.print(", Last Col: ");
+      Serial.print(local_last_column);
+      Serial.println();
+    }
+    
+    last_serial_output = current_time;
+  }
+  
+  delay(10);
+}
+#else 
+void loop() {
+  static uint32_t last_serial_output = 0;
+  uint32_t current_time = millis();
+  
+  // Serial output for debugging (10Hz)
+  if (current_time - last_serial_output >= 100) {
+    float local_angle, local_gyro_z;
+    int local_direction_state;
+    bool local_direction_stable;
+    uint8_t local_on_led[DOTSUU];
+    
+    // Get current values in thread-safe way
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      local_angle = angle;
+      local_gyro_z = gyro_z;
+      local_direction_state = direction_state;
+      local_direction_stable = direction_stable;
+      memcpy(local_on_led, (void*)on_led, DOTSUU);
+      xSemaphoreGive(dataMutex);
+      
+      Serial.print("Raw Angle: ");
+      Serial.print(raw_angle, 2);
+      Serial.print("°, Angle: ");
+      Serial.print(local_angle, 2);
+      Serial.print("°, Gyro Z: ");
+      Serial.print(local_gyro_z, 2);
+      Serial.print(" dps, Dir: ");
+      Serial.print(local_direction_state);
+      Serial.print(" (");
+      Serial.print(local_direction_stable ? "Stable" : "Unstable");
+      Serial.print("), LEDs: ");
+      
+      for (int i = 0; i < DOTSUU; i++) {
+        Serial.print(local_on_led[i]);
+      }
+      
+      Serial.println();
+    }
+    
+    last_serial_output = current_time;
+  }
+  
+  // Main loop can do other tasks or just delay
+  delay(10);
+}
+#endif 

@@ -1,6 +1,7 @@
 #include "l3gd20.h"
 #include "CharaData.h"
 #include <Wire.h>
+#include <esp32/rom/ets_sys.h>
 
 #define COL_BK  0    // 000 BLACK
 #define COL_BL  1    // 001 BLUE
@@ -34,7 +35,8 @@
 #define LOG_PERIOD  (100000L)
 
 #define AVE_LEN   9
-#define HIS_LEN   81
+//#define HIS_LEN   81
+#define HIS_LEN   9 
 
 void gyro_int(void);
 void led_blink_int(void);
@@ -148,7 +150,6 @@ void gyro_init(void)
   Serial.printf("I did it ");
 }
 
-#define HIS_LEN   9 
 #define ZEROSMP 15 
 #define ZEROCHK 10
 
@@ -208,8 +209,8 @@ void gyro_i2c(void *arg)
     
     angle += angvel[0] * 0.000001 * (float)del_micros ;
   
-    if(angle < 0 ) 
-      angle = 0 ;
+//    if(angle < 0 ) 
+//      angle = 0 ;
   
     if((angle > (float)MOJISUU_OFS)&&(angle < (float)(MOJISUU+MOJISUU_OFS))){
   //        idx = MOJISUU - (uint16_t)(angle - (float)MOJISUU_OFS);
